@@ -6,6 +6,7 @@ use crate::error::*;
 use rusqlite::{Connection, OpenFlags, Transaction, NO_PARAMS};
 use serde_json::{Map, Value};
 use sql_support::ConnExt;
+use std::convert::TryInto;
 use std::path::Path;
 
 // Simple migration from the "old" kinto-with-sqlite-backing implementation
@@ -101,23 +102,28 @@ struct Parsed<'a> {
     data: serde_json::Value,
 }
 
-pub fn migrate(tx: &Transaction<'_>, filename: &Path) -> Result<usize> {
+pub fn migrate(tx: &Transaction<'_>, filename: &Path) -> Result<MigrationInfo> {
     // We do the grouping manually, collecting string values as we go.
     let mut last_ext_id = "".to_string();
     let mut curr_values: Vec<(String, serde_json::Value)> = Vec::new();
     let mut curr_value_len = 0;
     let mut num_extensions = 0;
-    for row in read_rows(filename)? {
+    let (rows, mut mi) = read_rows(filename)?;
+    for row in rows {
         log::trace!("processing '{}' - '{}'", row.col_name, row.record);
         let parsed = match row.parse() {
             Some(p) => p,
-            None => continue,
+            None => {
+                mi.entries_failed += 1;
+                mi.non_fatal_errors_seen += 1;
+                continue;
+            }
         };
         // Do our "grouping"
         if parsed.ext_id != last_ext_id {
             if last_ext_id != "" && !curr_values.is_empty() {
                 // a different extension id - write what we have to the DB.
-                if do_insert(tx, &last_ext_id, curr_values) {
+                if do_insert(tx, &last_ext_id, curr_values, &mut mi) {
                     num_extensions += 1;
                 }
             }
@@ -132,6 +138,8 @@ pub fn migrate(tx: &Transaction<'_>, filename: &Path) -> Result<usize> {
             if new_len < MAX_LEN && curr_values.len() < MAX_KEYS {
                 curr_values.push((parsed.key.to_string(), parsed.data));
                 curr_value_len = new_len;
+            } else {
+                mi.overflowed_quotas = true;
             }
             log::trace!(
                 "extension {} now has {} bytes, {} keys",
@@ -144,22 +152,23 @@ pub fn migrate(tx: &Transaction<'_>, filename: &Path) -> Result<usize> {
     // and the last one
     if last_ext_id != "" && !curr_values.is_empty() {
         // a different extension id - write what we have to the DB.
-        if do_insert(tx, &last_ext_id, curr_values) {
+        if do_insert(tx, &last_ext_id, curr_values, &mut mi) {
             num_extensions += 1;
         }
     }
-    log::info!("migrated {} extensions", num_extensions);
-    Ok(num_extensions)
+    mi.collections_failed = mi.collections - num_extensions;
+    log::info!("migrated {} extensions: {:?}", num_extensions, mi);
+    Ok(mi)
 }
 
-fn read_rows(filename: &Path) -> Result<Vec<LegacyRow>> {
+fn read_rows(filename: &Path) -> Result<(Vec<LegacyRow>, MigrationInfo)> {
     let flags = OpenFlags::SQLITE_OPEN_NO_MUTEX | OpenFlags::SQLITE_OPEN_READ_ONLY;
     let src_conn = Connection::open_with_flags(&filename, flags)?;
     let mut stmt = src_conn.prepare(
         "SELECT collection_name, record FROM collection_data
          ORDER BY collection_name",
     )?;
-    let rows = stmt
+    let rows: Vec<LegacyRow> = stmt
         .query_and_then(NO_PARAMS, |row| -> Result<LegacyRow> {
             Ok(LegacyRow {
                 col_name: row.get(0)?,
@@ -168,13 +177,53 @@ fn read_rows(filename: &Path) -> Result<Vec<LegacyRow>> {
         })?
         .filter_map(Result::ok)
         .collect();
-    Ok(rows)
+
+    let entries =
+        src_conn.query_row::<i64, _, _>("SELECT COUNT(*) FROM collection_data", NO_PARAMS, |r| {
+            r.get(0)
+        });
+    let entries_is_err = entries.is_err();
+    let entries: usize = entries.unwrap_or_default().try_into().unwrap_or_default();
+
+    let collections = src_conn.query_row::<i64, _, _>(
+        "SELECT COUNT(DISTINCT collection_name) FROM collection_data",
+        NO_PARAMS,
+        |r| r.get(0),
+    );
+    let collections_is_err = collections.is_err();
+    let collections: usize = collections
+        .unwrap_or_default()
+        .try_into()
+        .unwrap_or_default();
+
+    let entries_failed = entries - rows.len();
+    let non_fatal_errors_seen =
+        entries_failed + (collections_is_err as usize) + (entries_is_err as usize);
+
+    let mi = MigrationInfo {
+        entries,
+        entries_failed,
+        collections,
+        non_fatal_errors_seen,
+        // Populated later.
+        collections_failed: 0,
+        overflowed_quotas: false,
+    };
+    Ok((rows, mi))
 }
 
-fn do_insert(tx: &Transaction<'_>, ext_id: &str, vals: Vec<(String, Value)>) -> bool {
+fn do_insert(
+    tx: &Transaction<'_>,
+    ext_id: &str,
+    vals: Vec<(String, Value)>,
+    mi: &mut MigrationInfo,
+) -> bool {
     let mut map = Map::with_capacity(vals.len());
     for (key, val) in vals {
-        map.insert(key, val);
+        if map.insert(key, val).is_some() {
+            // Probably impossible, means there was a non-distinct key in the original DB.
+            mi.entries_failed += 1;
+        }
     }
     match tx.execute_named_cached(
         "INSERT OR REPLACE INTO storage_sync_data(ext_id, data, sync_change_counter)
@@ -190,9 +239,32 @@ fn do_insert(tx: &Transaction<'_>, ext_id: &str, vals: Vec<(String, Value)>) -> 
         }
         Err(e) => {
             log::error!("failed to write data: {}", e);
+            mi.non_fatal_errors_seen += 1;
+            // mi.collections_failed is populated later.
             false
         }
     }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct MigrationInfo {
+    /// The number of entries (rows in the original table) we attempted to
+    /// migrate. Zero if there was some error in computing this number.
+    pub entries: usize,
+    /// The number of records we failed to migrate (zero for entirely successful
+    /// migrations).
+    pub entries_failed: usize,
+    /// The number of collections (distinct extension ids) in the original
+    /// table.
+    pub collections: usize,
+    /// The number of collections we failed to migrate
+    pub collections_failed: usize,
+    /// A count of recoverable non-fatal errors seen. Generally this will cause
+    /// the failed count to be nonzero, but there are other cases that can cause
+    /// error (failing to compute # of entries or collections).
+    pub non_fatal_errors_seen: usize,
+    /// True if we hit at least one quota error.
+    pub overflowed_quotas: bool,
 }
 
 #[cfg(test)]
@@ -232,8 +304,9 @@ mod tests {
         let mut db = new_mem_db();
         let tx = db.transaction().expect("tx should work");
 
-        let num = migrate(&tx, &tmpdir.path().join("source.db")).expect("migrate should work");
+        let mi = migrate(&tx, &tmpdir.path().join("source.db")).expect("migrate should work");
         tx.commit().expect("should work");
+        let num = mi.collections - mi.collections_failed;
         assert_eq!(num, num_expected);
         db
     }
