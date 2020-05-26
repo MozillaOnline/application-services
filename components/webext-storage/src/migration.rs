@@ -166,6 +166,7 @@ fn read_rows(filename: &Path) -> Result<(Vec<LegacyRow>, MigrationInfo)> {
     let src_conn = Connection::open_with_flags(&filename, flags)?;
     let mut stmt = src_conn.prepare(
         "SELECT collection_name, record FROM collection_data
+         WHERE collection_name != 'default/storage-sync-crypto'
          ORDER BY collection_name",
     )?;
     let rows: Vec<LegacyRow> = stmt
@@ -178,15 +179,18 @@ fn read_rows(filename: &Path) -> Result<(Vec<LegacyRow>, MigrationInfo)> {
         .filter_map(Result::ok)
         .collect();
 
-    let entries =
-        src_conn.query_row::<i64, _, _>("SELECT COUNT(*) FROM collection_data", NO_PARAMS, |r| {
-            r.get(0)
-        });
+    let entries = src_conn.query_row::<i64, _, _>(
+        "SELECT COUNT(*) FROM collection_data
+            WHERE collection_name != 'default/storage-sync-crypto'",
+        NO_PARAMS,
+        |r| r.get(0),
+    );
     let entries_is_err = entries.is_err();
     let entries: usize = entries.unwrap_or_default().try_into().unwrap_or_default();
 
     let collections = src_conn.query_row::<i64, _, _>(
-        "SELECT COUNT(DISTINCT collection_name) FROM collection_data",
+        "SELECT COUNT(DISTINCT collection_name) FROM collection_data
+            WHERE collection_name != 'default/storage-sync-crypto'",
         NO_PARAMS,
         |r| r.get(0),
     );
@@ -225,6 +229,7 @@ fn do_insert(
             mi.entries_failed += 1;
         }
     }
+    let entry_count = map.len();
     match tx.execute_named_cached(
         "INSERT OR REPLACE INTO storage_sync_data(ext_id, data, sync_change_counter)
          VALUES (:ext_id, :data, 1)",
@@ -240,13 +245,14 @@ fn do_insert(
         Err(e) => {
             log::error!("failed to write data: {}", e);
             mi.non_fatal_errors_seen += 1;
+            mi.entries_failed += entry_count;
             // mi.collections_failed is populated later.
             false
         }
     }
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct MigrationInfo {
     /// The number of entries (rows in the original table) we attempted to
     /// migrate. Zero if there was some error in computing this number.
@@ -277,7 +283,7 @@ mod tests {
 
     // Create a test database, populate it via the callback, migrate it, and
     // return a connection to the new, migrated DB for further checking.
-    fn do_migrate<F>(num_expected: usize, f: F) -> StorageDb
+    fn do_migrate<F>(mi_expected: MigrationInfo, f: F) -> StorageDb
     where
         F: FnOnce(&Connection),
     {
@@ -306,8 +312,8 @@ mod tests {
 
         let mi = migrate(&tx, &tmpdir.path().join("source.db")).expect("migrate should work");
         tx.commit().expect("should work");
-        let num = mi.collections - mi.collections_failed;
-        assert_eq!(num, num_expected);
+        dbg!(&mi);
+        assert_eq!(mi, mi_expected);
         db
     }
 
@@ -322,8 +328,17 @@ mod tests {
     #[test]
     fn test_happy_paths() {
         // some real data.
-        let conn = do_migrate(2, |c| {
-            c.execute_batch(
+        let conn = do_migrate(
+            MigrationInfo {
+                entries: 5,
+                entries_failed: 0,
+                collections: 2,
+                collections_failed: 0,
+                non_fatal_errors_seen: 0,
+                overflowed_quotas: false,
+            },
+            |c| {
+                c.execute_batch(
                 r#"INSERT INTO collection_data(collection_name, record)
                     VALUES
                     ('default/{e7fefcf3-b39c-4f17-5215-ebfe120a7031}', '{"id":"key-userWelcomed","key":"userWelcomed","data":1570659224457,"_status":"synced","last_modified":1579755940527}'),
@@ -334,7 +349,8 @@ mod tests {
                     ('default/https-everywhere@eff.org', '{"id":"key-migration_5F_version","key":"migration_version","data":2,"_status":"synced","last_modified":1570079919966}')
                     "#,
             ).expect("should popuplate")
-        });
+            },
+        );
 
         assert_has(
             &conn,
@@ -350,9 +366,19 @@ mod tests {
 
     #[test]
     fn test_sad_paths() {
-        do_migrate(0, |c| {
-            c.execute_batch(
-                r#"INSERT INTO collection_data(collection_name, record)
+        do_migrate(
+            MigrationInfo {
+                entries: 10,
+                // FIXME before landing: off by one somewhere...
+                entries_failed: 9,
+                collections: 6,
+                collections_failed: 6,
+                non_fatal_errors_seen: 9,
+                overflowed_quotas: false,
+            },
+            |c| {
+                c.execute_batch(
+                    r#"INSERT INTO collection_data(collection_name, record)
                     VALUES
                     ('default/test', '{"key":2,"data":1}'), -- key not a string
                     ('default/test', '{"key":"","data":1}'), -- key empty string
@@ -365,24 +391,35 @@ mod tests {
                     ('defaultx/test', '{"key":"k","data":1}'), -- bad key format 4
                     ('', '') -- empty strings
                     "#,
-            )
-            .expect("should populate");
-        });
+                )
+                .expect("should populate");
+            },
+        );
     }
 
     #[test]
     fn test_too_long() {
-        let conn = do_migrate(1, |c| {
-            for i in 0..1000 {
-                c.execute_batch(&format!(
-                    r#"INSERT INTO collection_data(collection_name, record)
+        let conn = do_migrate(
+            MigrationInfo {
+                entries: 1000,
+                entries_failed: 0,
+                collections: 1,
+                collections_failed: 0,
+                non_fatal_errors_seen: 0,
+                overflowed_quotas: true,
+            },
+            |c| {
+                for i in 0..1000 {
+                    c.execute_batch(&format!(
+                        r#"INSERT INTO collection_data(collection_name, record)
                            VALUES ('default/too_long', '{{"key":"{}","data":"{}"}}')"#,
-                    i,
-                    "x".repeat(2000)
-                ))
-                .expect("should populate");
-            }
-        });
+                        i,
+                        "x".repeat(2000)
+                    ))
+                    .expect("should populate");
+                }
+            },
+        );
         let data = api::get(&conn, "too_long", json!(null)).expect("get should work");
         // The way we calculate bytes is designed to be "fast and close enough"
         // rather than the exact number of bytes in the final json repr - so we
@@ -395,16 +432,26 @@ mod tests {
 
     #[test]
     fn test_too_many_keys() {
-        let conn = do_migrate(1, |c| {
-            for i in 0..2050 {
-                c.execute_batch(&format!(
-                    r#"INSERT INTO collection_data(collection_name, record)
+        let conn = do_migrate(
+            MigrationInfo {
+                entries: 2050,
+                entries_failed: 0,
+                collections: 1,
+                collections_failed: 0,
+                non_fatal_errors_seen: 0,
+                overflowed_quotas: true,
+            },
+            |c| {
+                for i in 0..2050 {
+                    c.execute_batch(&format!(
+                        r#"INSERT INTO collection_data(collection_name, record)
                            VALUES ('default/too_many', '{{"key":"{}","data":"yo"}}')"#,
-                    i
-                ))
-                .expect("should populate");
-            }
-        });
+                        i
+                    ))
+                    .expect("should populate");
+                }
+            },
+        );
         let data = api::get(&conn, "too_many", json!(null)).expect("get should work");
         assert_eq!(data.as_object().unwrap().len(), MAX_KEYS);
     }
